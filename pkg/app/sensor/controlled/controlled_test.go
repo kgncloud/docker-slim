@@ -3,29 +3,27 @@ package controlled_test
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/artifacts"
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/controlled"
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/monitors"
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/monitors/fanotify"
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/monitors/ptrace"
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/report"
-	"github.com/docker-slim/docker-slim/pkg/test/stub/sensor/execution"
-	stubmonitor "github.com/docker-slim/docker-slim/pkg/test/stub/sensor/monitor"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/artifact"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/controlled"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/monitor"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/monitor/fanotify"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/monitor/ptrace"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/mondel"
+	"github.com/slimtoolkit/slim/pkg/report"
+	"github.com/slimtoolkit/slim/pkg/test/stub/sensor/execution"
+	stubmonitor "github.com/slimtoolkit/slim/pkg/test/stub/sensor/monitor"
 )
 
-//
 // Stubs
-//
 func newStubMonitorFunc(
 	ctx context.Context,
 	fanMon fanotify.Monitor,
 	ptMon ptrace.Monitor,
-) monitors.NewCompositeMonitorFunc {
+) monitor.NewCompositeMonitorFunc {
 	if fanMon == nil {
 		fanMon = stubmonitor.NewFanMonitor(ctx)
 	}
@@ -37,14 +35,17 @@ func newStubMonitorFunc(
 		ctx context.Context,
 		cmd *command.StartMonitor,
 		workDir string,
+		del mondel.Publisher,
+		artifactsDir string,
 		mountPoint string,
 		origPaths map[string]struct{},
-		signalCh <-chan os.Signal,
-	) (monitors.CompositeMonitor, error) {
-		return monitors.Compose(
+	) (monitor.CompositeMonitor, error) {
+		return monitor.Compose(
 			cmd,
+			nil,
 			fanMon,
 			ptMon,
+			nil,
 			nil,
 		), nil
 	}
@@ -52,7 +53,11 @@ func newStubMonitorFunc(
 
 type artifactorStub struct{}
 
-var _ artifacts.Artifactor = &artifactorStub{}
+var _ artifact.Processor = &artifactorStub{}
+
+func (a *artifactorStub) ArtifactsDir() string {
+	return ""
+}
 
 func (a *artifactorStub) GetCurrentPaths(root string, excludes []string) (map[string]struct{}, error) {
 	return map[string]struct{}{}, nil
@@ -62,7 +67,11 @@ func (a *artifactorStub) PrepareEnv(cmd *command.StartMonitor) error {
 	return nil
 }
 
-func (a *artifactorStub) ProcessReports(
+func (a *artifactorStub) Archive() error {
+	return nil
+}
+
+func (a *artifactorStub) Process(
 	cmd *command.StartMonitor,
 	mountPoint string,
 	peReport *report.PeMonitorReport,
@@ -72,9 +81,7 @@ func (a *artifactorStub) ProcessReports(
 	return nil
 }
 
-//
 // Tests
-//
 func TestStartStopShutdown(t *testing.T) {
 	ctx := context.Background()
 	exe := execution.NewExecution()
@@ -82,6 +89,7 @@ func TestStartStopShutdown(t *testing.T) {
 		ctx,
 		exe,
 		newStubMonitorFunc(ctx, nil, nil),
+		nil, //Monitor Data Event Log
 		&artifactorStub{},
 		"", "",
 	)
@@ -109,6 +117,7 @@ func TestShutdownBeforeStart(t *testing.T) {
 		ctx,
 		exe,
 		newStubMonitorFunc(ctx, nil, nil),
+		nil, //Monitor Data Event Log
 		&artifactorStub{},
 		"", "",
 	)
@@ -129,6 +138,7 @@ func TestStartFollowedByShutdown(t *testing.T) {
 		ctx,
 		exe,
 		newStubMonitorFunc(ctx, nil, nil),
+		nil, //Monitor Data Event Log
 		&artifactorStub{},
 		"", "",
 	)
@@ -150,6 +160,7 @@ func TestStopNonStartedMonitor(t *testing.T) {
 		ctx,
 		exe,
 		newStubMonitorFunc(ctx, nil, nil),
+		nil, //Monitor Data Event Log
 		&artifactorStub{},
 		"", "",
 	)

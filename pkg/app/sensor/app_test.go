@@ -13,9 +13,11 @@ import (
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
-	testsensor "github.com/docker-slim/docker-slim/pkg/test/e2e/sensor"
-	testutil "github.com/docker-slim/docker-slim/pkg/test/util"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/standalone/control"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/report"
+	testsensor "github.com/slimtoolkit/slim/pkg/test/e2e/sensor"
+	testutil "github.com/slimtoolkit/slim/pkg/test/util"
 )
 
 const (
@@ -25,13 +27,10 @@ const (
 
 var (
 	sensorFullLifecycleSequence = []string{
-		"sensor: uid=0 euid=0",
+		"sensor: ver=",
 		"sensor: creating monitors...",
 		"sensor: starting monitors...",
-		"fanmon: Start",
-		"ptmon: Start",
-		"sensor: monitor - saving report",
-		"sensor: monitor - saving report",
+		"sensor: run finished succesfully",
 	}
 
 	sensorLifecycleHookSequence = []string{
@@ -141,7 +140,7 @@ func TestSimpleSensorRun_Standalone_CLI(t *testing.T) {
 	sensor.AssertReportIncludesFiles(t, "/bin/cat", "/bin/busybox", "/etc/alpine-release")
 	sensor.AssertReportNotIncludesFiles(t, "/bin/echo2", "/etc/resolve.conf")
 
-	sensor.AssertSensorEventFileContains(t, ctx,
+	sensor.AssertSensorEventsFileContains(t, ctx,
 		event.StartMonitorDone,
 		event.StopMonitorDone,
 		event.ShutdownSensorDone,
@@ -323,7 +322,7 @@ func TestLifecycleHook_Controlled_CLI(t *testing.T) {
 		t.TempDir(),
 		runID,
 		imageSimpleCLI,
-		testsensor.WithLifecycleHook("echo"),
+		testsensor.WithSensorLifecycleHook("echo"),
 	)
 	defer sensor.Cleanup(t, ctx)
 
@@ -359,7 +358,7 @@ func TestLifecycleHook_Standalone_CLI(t *testing.T) {
 		t.TempDir(),
 		runID,
 		imageSimpleCLI,
-		testsensor.WithLifecycleHook("echo"),
+		testsensor.WithSensorLifecycleHook("echo"),
 	)
 	defer sensor.Cleanup(t, ctx)
 
@@ -389,4 +388,285 @@ func TestRunTargetAsUser(t *testing.T) {
 
 	sensor.AssertSensorLogsContain(t, ctx, sensorFullLifecycleSequence...)
 	sensor.AssertTargetAppLogsContain(t, ctx, "daemon")
+}
+
+func TestTargetAppEnvVars(t *testing.T) {
+	cases := []struct {
+		image string
+		user  string
+		home  string
+	}{
+		// nixery.dev/shell lacks the /etc/passwd file: all UIDs should end up with HOME=/
+		{image: "nixery.dev/shell", user: "0", home: "/"},
+		{image: "nixery.dev/shell", user: "65534", home: "/"},
+
+		// Alpine
+		{image: imageSimpleCLI, home: "/root"},
+		{image: imageSimpleCLI, user: "root", home: "/root"},
+		{image: imageSimpleCLI, user: "0", home: "/root"},
+		{image: imageSimpleCLI, user: "nobody", home: "/"},
+		{image: imageSimpleCLI, user: "65534", home: "/"}, // nobody's UID
+		{image: imageSimpleCLI, user: "bin", home: "/bin"},
+		{image: imageSimpleCLI, user: "1", home: "/bin"}, // bin's UID
+		{image: imageSimpleCLI, user: "daemon", home: "/sbin"},
+		{image: imageSimpleCLI, user: "2", home: "/sbin"}, // daemon's UID
+		{image: imageSimpleCLI, user: "nosuchuser", home: "/"},
+		{image: imageSimpleCLI, user: "14567", home: "/"}, // hopefully, no such UID
+
+		// Nginx
+		{image: imageSimpleService, user: "nginx", home: "/nonexistent"},
+		{image: imageSimpleService, user: "101", home: "/nonexistent"}, // nginx's UID
+		{image: imageSimpleService, user: "nobody", home: "/"},
+		{image: imageSimpleService, user: "65534", home: "/"}, // nobody's UID
+		{image: imageSimpleService, user: "daemon", home: "/usr/sbin"},
+		{image: imageSimpleService, user: "1", home: "/usr/sbin"}, // daemon's UID
+		{image: imageSimpleService, user: "nosuchuser", home: "/"},
+		{image: imageSimpleService, user: "14567", home: "/"}, // hopefully, no such UID
+	}
+
+	for _, tcase := range cases {
+		func() {
+			runID := newTestRun(t)
+			ctx := context.Background()
+
+			sensor := testsensor.NewSensorOrFail(t, ctx, t.TempDir(), runID, tcase.image)
+			defer sensor.Cleanup(t, ctx)
+
+			var startOpts []testsensor.StartMonitorOpt
+			if len(tcase.user) > 0 {
+				startOpts = append(startOpts, testsensor.WithAppUser(tcase.user))
+			}
+			sensor.StartStandaloneOrFail(
+				t, ctx, []string{"env"},
+				testsensor.NewMonitorStartCommand(startOpts...),
+			)
+			sensor.WaitOrFail(t, ctx)
+
+			sensor.AssertSensorLogsContain(t, ctx, sensorFullLifecycleSequence...)
+			sensor.AssertTargetAppLogsContain(t, ctx, "HOME="+tcase.home)
+		}()
+	}
+}
+
+func TestArchiveArtifacts_HappyPath(t *testing.T) {
+	runID := newTestRun(t)
+	ctx := context.Background()
+
+	sensor := testsensor.NewSensorOrFail(
+		t, ctx, t.TempDir(), runID, imageSimpleCLI,
+		testsensor.WithSensorLogsToFile(),
+	)
+	defer sensor.Cleanup(t, ctx)
+
+	sensor.StartStandaloneOrFail(
+		t, ctx,
+		[]string{"cat", "/etc/alpine-release"},
+		testsensor.NewMonitorStartCommand(
+			testsensor.WithSaneDefaults(),
+			testsensor.WithAppStdoutToFile(),
+			testsensor.WithAppStderrToFile(),
+		),
+	)
+	sensor.WaitOrFail(t, ctx)
+
+	sensor.DownloadArtifactsOrFail(t, ctx)
+
+	sensor.AssertArtifactsArchiveContains(t, ctx,
+		report.DefaultContainerReportFileName,
+		testsensor.EventsFileName,
+		testsensor.CommandsFileName,
+		testsensor.SensorLogFileName,
+		testsensor.AppStdoutFileName,
+		testsensor.AppStderrFileName,
+	)
+}
+
+func TestArchiveArtifacts_CustomLocation(t *testing.T) {
+	runID := newTestRun(t)
+	ctx := context.Background()
+
+	sensor := testsensor.NewSensorOrFail(
+		t, ctx, t.TempDir(), runID, imageSimpleCLI,
+		testsensor.WithSensorLogsToFile(),
+		testsensor.WithSensorArtifactsDir("/opt/not-dockerslim-at-all/files"),
+	)
+	defer sensor.Cleanup(t, ctx)
+
+	sensor.StartStandaloneOrFail(
+		t, ctx,
+		[]string{"cat", "/etc/alpine-release"},
+		testsensor.NewMonitorStartCommand(
+			testsensor.WithSaneDefaults(),
+			testsensor.WithAppStdoutToFile(),
+			testsensor.WithAppStderrToFile(),
+		),
+	)
+	sensor.WaitOrFail(t, ctx)
+
+	sensor.DownloadArtifactsOrFail(t, ctx)
+
+	sensor.AssertArtifactsArchiveContains(t, ctx,
+		report.DefaultContainerReportFileName,
+		testsensor.EventsFileName,
+		testsensor.CommandsFileName,
+		testsensor.SensorLogFileName,
+		testsensor.AppStdoutFileName,
+		testsensor.AppStderrFileName,
+	)
+}
+
+func TestArchiveArtifacts_SensorFailure_NoCaps(t *testing.T) {
+	runID := newTestRun(t)
+	ctx := context.Background()
+
+	sensor := testsensor.NewSensorOrFail(
+		t, ctx, t.TempDir(), runID, imageSimpleCLI,
+		testsensor.WithSensorLogsToFile(),
+		testsensor.WithSensorCapabilities(), // Cancels out the default --cap-add=ALL.
+	)
+	defer sensor.Cleanup(t, ctx)
+
+	sensor.StartStandaloneOrFail(
+		t, ctx,
+		[]string{"cat", "/etc/alpine-release"},
+		testsensor.NewMonitorStartCommand(
+			testsensor.WithSaneDefaults(),
+			testsensor.WithAppStdoutToFile(),
+			testsensor.WithAppStderrToFile(),
+			testsensor.WithAppStderrToFile(),
+		),
+	)
+	sensor.WaitOrFail(t, ctx)
+
+	sensor.DownloadArtifactsOrFail(t, ctx)
+
+	sensor.AssertSensorLogsContain(t, ctx, []string{
+		"sensor: creating monitors...",
+		"sensor: starting monitors...",
+		"sensor: composite monitor - FAN failed to start running", // <-- failure!
+		"sensor: run finished with error",
+	}...)
+
+	sensor.AssertArtifactsArchiveContains(t, ctx,
+		testsensor.EventsFileName,
+		testsensor.CommandsFileName,
+		testsensor.SensorLogFileName,
+	)
+}
+
+func TestArchiveArtifacts_SensorFailure_NoRoot(t *testing.T) {
+	// It's a fairly common failure scenario.
+	t.Skip("Implement me!")
+}
+
+func TestStopSignal_ForceKill(t *testing.T) {
+	runID := newTestRun(t)
+	ctx := context.Background()
+
+	wrongStopSignal := syscall.SIGUSR1 // This signal isn't going to make Nginx exit.
+	sensor := testsensor.NewSensorOrFail(
+		t, ctx, t.TempDir(), runID, imageSimpleService,
+		testsensor.WithStopSignal(wrongStopSignal), // Emulate misconfiguration.
+	)
+	defer sensor.Cleanup(t, ctx)
+
+	sensor.StartStandaloneOrFail(t, ctx, nil)
+	go testutil.Delayed(ctx, 5*time.Second, func() {
+		// However, the sensor will terminate the target app
+		// anyway, when the grace period after receiving the
+		// stop signal is over.
+		sensor.SignalOrFail(t, ctx, wrongStopSignal)
+	})
+	sensor.WaitOrFail(t, ctx)
+
+	sensor.AssertSensorLogsContain(t, ctx, sensorFullLifecycleSequence...)
+	sensor.AssertTargetAppLogsContain(t, ctx,
+		"nginx/1.21",
+		"start worker processes",
+		"sensor: stop signal was sent to target app - starting grace period",
+		"sensor: grace timeout expired - SIGKILL goes to target app",
+	)
+
+	sensor.DownloadArtifactsOrFail(t, ctx)
+	sensor.AssertReportIncludesFiles(t,
+		"/etc/nginx/nginx.conf",
+		"/etc/nginx/conf.d/default.conf",
+		"/var/cache/nginx",
+		"/var/run",
+		// Because the target app was terminated by SIGKILL,
+		// the pid file is not cleaned up.
+		"/run/nginx.pid",
+	)
+	sensor.AssertReportNotIncludesFiles(t,
+		"/bin/bash",
+		"/bin/cat",
+		"/etc/apt/sources.list",
+	)
+}
+
+func TestControlCommands_StopTargetApp(t *testing.T) {
+	runID := newTestRun(t)
+	ctx := context.Background()
+
+	sensor := testsensor.NewSensorOrFail(t, ctx, t.TempDir(), runID, imageSimpleService)
+	defer sensor.Cleanup(t, ctx)
+
+	sensor.StartStandaloneOrFail(t, ctx, nil)
+
+	go testutil.Delayed(ctx, 5*time.Second, func() {
+		sensor.ExecuteControlCommandOrFail(t, ctx, control.StopTargetAppCommand)
+		sensor.WaitForEventOrFail(t, ctx, event.StopMonitorDone)
+		sensor.WaitForEventOrFail(t, ctx, event.ShutdownSensorDone)
+
+		// In the real world, there might be some (long) time between
+		// the stop command and the target app signalling - maybe
+		// we need to simulate that here?
+		sensor.SignalOrFail(t, ctx, syscall.SIGQUIT)
+	})
+
+	sensor.WaitOrFail(t, ctx)
+
+	sensor.AssertSensorLogsContain(t, ctx, sensorFullLifecycleSequence...)
+}
+
+func TestEnableMondel(t *testing.T) {
+	runID := newTestRun(t)
+	ctx := context.Background()
+
+	sensor := testsensor.NewSensorOrFail(
+		t, ctx, t.TempDir(), runID, imageSimpleService,
+		testsensor.WithEnableMondel(),
+	)
+	defer sensor.Cleanup(t, ctx)
+
+	sensor.StartStandaloneOrFail(t, ctx, nil)
+	go testutil.Delayed(ctx, 5*time.Second, func() {
+		sensor.SignalOrFail(t, ctx, syscall.SIGTERM)
+	})
+	sensor.WaitOrFail(t, ctx)
+
+	sensor.AssertSensorLogsContain(t, ctx, sensorFullLifecycleSequence...)
+
+	sensor.DownloadArtifactsOrFail(t, ctx)
+
+	sensor.AssertMondelIncludesFiles(t,
+		"/etc/nginx/nginx.conf",
+		"/etc/nginx/conf.d/default.conf",
+
+		// TODO: investigate why these files are not included in the mondel (but are in the creport).
+		// "/bin/sh",
+		// "/var/cache/nginx",
+		// "/var/run",
+	)
+	sensor.AssertMondelNotIncludesFiles(t,
+		"/bin/bash",
+		"/bin/cat",
+		"/etc/apt/sources.list",
+
+		// TODO: investigate why this file is included in the mondel (but not in the creport).
+		// "/run/nginx.pid",
+	)
+
+	// Uncomment when the mondel and creport file sets are synced.
+	// sensor.AssertReportAndMondelFileListsMatch(t)
 }

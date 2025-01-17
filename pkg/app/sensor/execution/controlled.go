@@ -5,9 +5,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/ipc"
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/ipc"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
 )
 
 type controlledExe struct {
@@ -49,5 +49,10 @@ func (e *controlledExe) Commands() <-chan command.Message {
 }
 
 func (e *controlledExe) PubEvent(etype event.Type, data ...interface{}) {
-	e.ipcServer.TryPublishEvt(&event.Message{Name: etype, Data: data}, 3)
+	evt := &event.Message{Name: etype}
+	if len(data) > 0 {
+		evt.Data = data[0]
+	}
+
+	e.ipcServer.TryPublishEvt(evt, 3)
 }

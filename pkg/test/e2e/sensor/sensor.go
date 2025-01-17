@@ -1,10 +1,12 @@
 package sensor
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,26 +17,31 @@ import (
 
 	dockerapi "github.com/fsouza/go-dockerclient"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
-	"github.com/docker-slim/docker-slim/pkg/app/master/inspectors/ipc"
-	"github.com/docker-slim/docker-slim/pkg/app/master/inspectors/sensor"
-	"github.com/docker-slim/docker-slim/pkg/ipc/channel"
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
-	"github.com/docker-slim/docker-slim/pkg/report"
-	"github.com/docker-slim/docker-slim/pkg/util/fsutil"
+	"github.com/slimtoolkit/slim/pkg/app"
+	"github.com/slimtoolkit/slim/pkg/app/master/inspectors/ipc"
+	"github.com/slimtoolkit/slim/pkg/app/master/inspectors/sensor"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/standalone/control"
+	"github.com/slimtoolkit/slim/pkg/ipc/channel"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/report"
+	"github.com/slimtoolkit/slim/pkg/util/fsutil"
 )
 
 const (
 	// Intentionally duplicating values here since to make sure a refactoing
 	// of the paths on the sensor side won't be unnoticed.
-	artifactDirName   = "artifacts"
-	artifactDirPath   = "/opt/dockerslim/" + artifactDirName
-	commandFileName   = "commands.json"
-	sensorLogFileName = "sensor.log"
-	appStdoutFileName = "app_stdout.log"
-	appStderrFileName = "app_stderr.log"
-	eventFileName     = "events.json"
+	CommandsFileName  = "commands.json"
+	SensorLogFileName = "sensor.log"
+	MondelFileName    = "mondel.ndjson"
+	AppStdoutFileName = "app_stdout.log"
+	AppStderrFileName = "app_stderr.log"
+	EventsFileName    = "events.json"
+	runArchiveName    = "run.tar"
+
+	sensorExePath = "/opt/_slim/sensor"
 )
 
 var (
@@ -49,9 +56,39 @@ func WithSensorLogsToFile() sensorOpt {
 	}
 }
 
-func WithLifecycleHook(cmd string) sensorOpt {
+func WithEnableMondel() sensorOpt {
+	return func(s *Sensor) {
+		s.enableMondel = true
+	}
+}
+
+func WithSensorArtifactsDir(dir string) sensorOpt {
+	return func(s *Sensor) {
+		s.artifactsDirPath = dir
+	}
+}
+
+func WithSensorLifecycleHook(cmd string) sensorOpt {
 	return func(s *Sensor) {
 		s.lifecycleHook = cmd
+	}
+}
+
+func WithSensorCapabilities(caps ...string) sensorOpt {
+	return func(s *Sensor) {
+		s.capAdd = caps
+	}
+}
+
+func WithoutSensorCapabilities(caps ...string) sensorOpt {
+	return func(s *Sensor) {
+		s.capDrop = caps
+	}
+}
+
+func WithStopSignal(sig syscall.Signal) sensorOpt {
+	return func(s *Sensor) {
+		s.stopSignal = sig
 	}
 }
 
@@ -61,17 +98,28 @@ type Sensor struct {
 	sensorExePath  string
 	contextDirPath string
 
-	useLogFile    bool
-	lifecycleHook string
+	// "Opts"
+	useLogFile       bool
+	enableMondel     bool
+	artifactsDirPath string
+	lifecycleHook    string
+	capAdd           []string
+	capDrop          []string
+	user             string
+	stopSignal       syscall.Signal
 
 	// "Nullable"
-	contID  string
-	client  *ipc.Client
-	stopped bool
+	contID      string
+	rawCommands string
+	client      *ipc.Client
+	stopped     bool
 
 	// "Artifacts"
-	creport   *report.ContainerReport
-	rawEvents string
+	creport    *report.ContainerReport
+	rawCReport string
+	rawEvents  string
+	mondel     []report.MonitorDataEvent
+	rawMondel  string
 }
 
 func NewSensor(
@@ -106,6 +154,8 @@ func NewSensor(
 		contName:       strings.ToLower(contName),
 		sensorExePath:  sensorExePath,
 		contextDirPath: contextDirPath,
+		capAdd:         []string{"ALL"},
+		user:           "0",
 	}
 
 	for _, opt := range opts {
@@ -135,15 +185,17 @@ func (s *Sensor) StartControlled(ctx context.Context) error {
 
 	contID, err := containerCreate(
 		ctx,
-		[]string{
-			"--name", s.contName,
-			"--cap-add", "ALL",
-			"--user", "root",
-			"--volume", s.sensorExePath + ":/opt/dockerslim/sensor",
-			"--publish", fmt.Sprintf("%d", channel.CmdPort),
-			"--publish", fmt.Sprintf("%d", channel.EvtPort),
-			"--entrypoint", "/opt/dockerslim/sensor",
-		},
+		flatten(
+			s.capabilities(),
+			[]string{
+				"--name", s.contName,
+				"--user", s.user,
+				"--volume", s.sensorExePath + ":" + sensorExePath,
+				"--publish", fmt.Sprintf("%d", channel.CmdPort),
+				"--publish", fmt.Sprintf("%d", channel.EvtPort),
+				"--entrypoint", sensorExePath,
+			},
+		),
 		s.image.ID,
 		s.commonStartFlags()...,
 	)
@@ -204,13 +256,21 @@ func (s *Sensor) StartStandalone(
 		WithField("command", fmt.Sprintf("%+v", cmd)).
 		Debug("Starting test sensor (standalone mode)...")
 
-	commandFilePath := filepath.Join(s.contextDirPath, commandFileName)
-	if err := jsonDump(commandFilePath, cmd); err != nil {
-		return fmt.Errorf("cannot create %s file: %w", commandFileName, err)
+	commandsFilePath := filepath.Join(s.contextDirPath, CommandsFileName)
+	if err := jsonDump(commandsFilePath, cmd); err != nil {
+		return fmt.Errorf("cannot create %s file: %w", CommandsFileName, err)
 	}
 
+	rawCommands, err := os.ReadFile(commandsFilePath)
+	if err != nil {
+		return fmt.Errorf("cannot re-read %s file: %w", CommandsFileName, err)
+	}
+	s.rawCommands = string(rawCommands)
+
 	stopSignal := "SIGTERM"
-	if len(s.image.Config.StopSignal) > 0 {
+	if s.stopSignal != 0 {
+		stopSignal = unix.SignalName(s.stopSignal)
+	} else if len(s.image.Config.StopSignal) > 0 {
 		stopSignal = s.image.Config.StopSignal
 	}
 
@@ -222,21 +282,23 @@ func (s *Sensor) StartStandalone(
 
 	contID, err := containerCreate(
 		ctx,
-		[]string{
-			"--name", s.contName,
-			"--cap-add", "ALL",
-			"--user", "root",
-			"--volume", s.sensorExePath + ":/opt/dockerslim/sensor",
-			"--volume", commandFilePath + ":/opt/dockerslim/commands.json",
-			"--entrypoint", "/opt/dockerslim/sensor",
-		},
+		flatten(
+			s.capabilities(),
+			[]string{
+				"--name", s.contName,
+				"--user", s.user,
+				"--volume", s.sensorExePath + ":" + sensorExePath,
+				"--volume", commandsFilePath + ":/opt/_slim/commands.json",
+				"--entrypoint", sensorExePath,
+			},
+		),
 		s.image.ID,
 		flatten(
 			s.commonStartFlags(),
 			// Standalone flags
 			[]string{
 				"-m", "standalone",
-				"-c", "/opt/dockerslim/commands.json",
+				"-c", "/opt/_slim/commands.json",
 				"-s", stopSignal,
 				"-w", stopTimeout.String(),
 				"--",
@@ -272,6 +334,16 @@ func (s *Sensor) StartStandaloneOrFail(
 }
 
 func (s *Sensor) SendCommand(ctx context.Context, cmd command.Message) error {
+	msg, err := command.Encode(cmd)
+	if err != nil {
+		return fmt.Errorf("cannot encode command %q: %w", cmd, err)
+	}
+	log.Debugf("Sending command to the test sensor: %s", string(msg))
+
+	if len(s.contID) == 0 {
+		return errNotStarted
+	}
+
 	if s.client == nil {
 		return errors.New("IPC client isn't initialized - is sensor running?")
 	}
@@ -310,6 +382,59 @@ func (s *Sensor) SendStopCommand(ctx context.Context) error {
 func (s *Sensor) SendStopCommandOrFail(t *testing.T, ctx context.Context) {
 	if err := s.SendStopCommand(ctx); err != nil {
 		t.Fatal("Failed sending StopMonitor command:", err)
+	}
+}
+
+func (s *Sensor) ExecuteControlCommand(ctx context.Context, cmd control.Command) error {
+	if len(s.contID) == 0 {
+		return errNotStarted
+	}
+
+	if s.client != nil {
+		return fmt.Errorf("cannot execute control command - sensor is not in the standalone mode")
+	}
+
+	if out, err := containerExec(
+		ctx,
+		s.contID,
+		sensorExePath,
+		"control",
+		string(cmd),
+	); err != nil {
+		return fmt.Errorf("cannot execute control command: %w\n%s", err, string(out))
+	}
+
+	return nil
+}
+
+func (s *Sensor) ExecuteControlCommandOrFail(t *testing.T, ctx context.Context, cmd control.Command) {
+	if err := s.ExecuteControlCommand(ctx, cmd); err != nil {
+		t.Fatalf("Failed executing control command %s: %v", cmd, err)
+	}
+}
+
+func (s *Sensor) WaitForEvent(ctx context.Context, evt event.Type) error {
+	if len(s.contID) == 0 {
+		return errNotStarted
+	}
+
+	if out, err := containerExec(
+		ctx,
+		s.contID,
+		sensorExePath,
+		"control",
+		string(control.WaitForEventCommand),
+		string(evt),
+	); err != nil {
+		return fmt.Errorf("cannot wait for sensor event %s: %w\n%s", evt, err, string(out))
+	}
+
+	return nil
+}
+
+func (s *Sensor) WaitForEventOrFail(t *testing.T, ctx context.Context, evt event.Type) {
+	if err := s.WaitForEvent(ctx, evt); err != nil {
+		t.Fatalf("Failed waiting for sensor event %s: %v", evt, err)
 	}
 }
 
@@ -372,33 +497,53 @@ func (s *Sensor) DownloadArtifacts(ctx context.Context) error {
 		return errNotStarted
 	}
 
-	localArtifactPath := filepath.Join(s.contextDirPath, artifactDirName)
 	if err := containerCopyFrom(
 		ctx,
 		s.contID,
-		artifactDirPath,
-		localArtifactPath,
+		s.remoteArtifactsDirPath(),
+		s.localArtifactsDirPath(),
 	); err != nil {
 		return fmt.Errorf("cannot download test sensor's artifacts: %w", err)
 	}
 
-	var creport report.ContainerReport
-	if err := fsutil.LoadStructFromFile(
-		filepath.Join(localArtifactPath, report.DefaultContainerReportFileName),
-		&creport,
-	); err != nil {
-		return fmt.Errorf("cannot load test sensor's report: %w", err)
+	creportFilePath := filepath.Join(s.localArtifactsDirPath(), report.DefaultContainerReportFileName)
+	rawCReport, err := os.ReadFile(creportFilePath)
+	if err == nil {
+		s.rawCReport = string(rawCReport)
+
+		var creport report.ContainerReport
+		if err := fsutil.LoadStructFromFile(creportFilePath, &creport); err != nil {
+			return fmt.Errorf("cannot decode test sensor's report: %w", err)
+		}
+		s.creport = &creport
 	}
 
-	s.creport = &creport
+	if s.enableMondel {
+		mondelFilePath := filepath.Join(s.localArtifactsDirPath(), MondelFileName)
+		rawMondel, err := os.ReadFile(mondelFilePath)
+		if err != nil {
+			return fmt.Errorf("cannot read %s file: %w", MondelFileName, err)
+		}
+
+		s.rawMondel = string(rawMondel)
+
+		for _, line := range strings.Split(strings.TrimSpace(s.rawMondel), "\n") {
+			var evt report.MonitorDataEvent
+			if err := json.Unmarshal([]byte(line), &evt); err != nil {
+				return fmt.Errorf("cannot decode test sensor's mondel line %#q: %w", line, err)
+			}
+			s.mondel = append(s.mondel, evt)
+		}
+	}
 
 	if s.client == nil {
-		rawEvents, err := os.ReadFile(filepath.Join(s.contextDirPath, artifactDirName, eventFileName))
+		rawEvents, err := os.ReadFile(filepath.Join(s.localArtifactsDirPath(), EventsFileName))
 		if err != nil {
-			return fmt.Errorf("cannot read %s file: %w", eventFileName, err)
+			return fmt.Errorf("cannot read %s file: %w", EventsFileName, err)
 		}
 		s.rawEvents = string(rawEvents)
 	}
+
 	return nil
 }
 
@@ -435,7 +580,7 @@ func (s *Sensor) ContainerLogs(ctx context.Context) (string, error) {
 func (s *Sensor) ContainerLogsOrFail(t *testing.T, ctx context.Context) string {
 	logs, err := s.ContainerLogs(ctx)
 	if err != nil {
-		t.Fatal("Cannot retrieve target container logs", err)
+		t.Fatal("Cannot retrieve target container logs:", err)
 	}
 	return logs
 }
@@ -443,7 +588,7 @@ func (s *Sensor) ContainerLogsOrFail(t *testing.T, ctx context.Context) string {
 func (s *Sensor) SensorLogs(ctx context.Context) (string, error) {
 	if s.useLogFile {
 		bytes, err := os.ReadFile(
-			filepath.Join(s.contextDirPath, artifactDirName, sensorLogFileName),
+			filepath.Join(s.localArtifactsDirPath(), SensorLogFileName),
 		)
 		return string(bytes), err
 	}
@@ -453,7 +598,7 @@ func (s *Sensor) SensorLogs(ctx context.Context) (string, error) {
 func (s *Sensor) SensorLogsOrFail(t *testing.T, ctx context.Context) string {
 	logs, err := s.SensorLogs(ctx)
 	if err != nil {
-		t.Fatal("Cannot retrieve sensor logs", err)
+		t.Fatal("Cannot retrieve sensor logs:", err)
 	}
 	return logs
 }
@@ -467,21 +612,32 @@ func (s *Sensor) PrintState(ctx context.Context) {
 		WithField("creport downloaded", s.creport != nil).
 		Info("Printing out test sensor state")
 
-	if s.creport != nil {
+	if len(s.rawCReport) > 0 {
 		fmt.Fprintln(os.Stderr, "-=== Container report ===-")
-		encoder := json.NewEncoder(os.Stderr)
-		encoder.SetEscapeHTML(false)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(s.creport); err != nil {
-			log.WithError(err).Error("Cannot print out container report")
-		}
+		fmt.Fprintln(os.Stderr, s.rawCReport)
 		fmt.Fprintln(os.Stderr, "-=== eof: Container report ===-")
+	}
+
+	if len(s.rawMondel) > 0 {
+		fmt.Fprintln(os.Stderr, "-=== Container MonDEL ===-")
+		fmt.Fprintln(os.Stderr, s.rawMondel)
+		fmt.Fprintln(os.Stderr, "-=== eof: Container MonDEL ===-")
 	}
 
 	if len(s.rawEvents) > 0 {
 		fmt.Fprintln(os.Stderr, "-=== events.json ===-")
 		fmt.Fprintln(os.Stderr, s.rawEvents)
 		fmt.Fprintln(os.Stderr, "-=== eof: events.json ===-")
+	}
+
+	if len(s.contID) > 0 && s.useLogFile {
+		fmt.Fprintln(os.Stderr, "-=== Sensor logs ===-")
+		if sensorLogs, err := s.SensorLogs(ctx); err == nil {
+			fmt.Fprintln(os.Stderr, sensorLogs)
+		} else {
+			log.WithError(err).Error("Cannot obtain sensor logs")
+		}
+		fmt.Fprintln(os.Stderr, "-=== eof: Sensor logs ===-")
 	}
 
 	if len(s.contID) > 0 {
@@ -548,11 +704,11 @@ func (s *Sensor) AssertTargetAppLogsEqualTo(t *testing.T, ctx context.Context, w
 }
 
 func (s *Sensor) AssertTargetAppStdoutFileEqualsTo(t *testing.T, ctx context.Context, expected string) {
-	s.assertTargetAppStdFileEqualsTo(t, ctx, appStdoutFileName, expected)
+	s.assertTargetAppStdFileEqualsTo(t, ctx, AppStdoutFileName, expected)
 }
 
 func (s *Sensor) AssertTargetAppStderrFileEqualsTo(t *testing.T, ctx context.Context, expected string) {
-	s.assertTargetAppStdFileEqualsTo(t, ctx, appStderrFileName, expected)
+	s.assertTargetAppStdFileEqualsTo(t, ctx, AppStderrFileName, expected)
 }
 
 func (s *Sensor) assertTargetAppStdFileEqualsTo(
@@ -565,7 +721,7 @@ func (s *Sensor) assertTargetAppStdFileEqualsTo(
 		t.Fatal("Test sensor container hasn't been started yet")
 	}
 
-	data, err := os.ReadFile(filepath.Join(s.contextDirPath, artifactDirName, kind))
+	data, err := os.ReadFile(filepath.Join(s.localArtifactsDirPath(), kind))
 	if err != nil {
 		t.Fatalf("cannot read %s file: %v", kind, err)
 	}
@@ -577,7 +733,7 @@ func (s *Sensor) assertTargetAppStdFileEqualsTo(
 }
 
 // Checks the presense of the expected events AND the occurrence order.
-func (s *Sensor) AssertSensorEventFileContains(
+func (s *Sensor) AssertSensorEventsFileContains(
 	t *testing.T,
 	ctx context.Context,
 	expected ...event.Type,
@@ -627,15 +783,142 @@ func (s *Sensor) AssertReportNotIncludesFiles(t *testing.T, filepath ...string) 
 	}
 }
 
+func (s *Sensor) AssertMondelIncludesFiles(t *testing.T, filepath ...string) {
+	if s.mondel == nil {
+		t.Fatal("No sensor mondel file found")
+	}
+
+	index := mondelEventByFilePath(s.mondel)
+	for _, f := range filepath {
+		if _, found := index[f]; !found {
+			t.Errorf("Expected file %q not found in the mondel file", f)
+		}
+	}
+}
+
+func (s *Sensor) AssertMondelNotIncludesFiles(t *testing.T, filepath ...string) {
+	if s.mondel == nil {
+		t.Fatal("No sensor mondel file found")
+	}
+
+	index := mondelEventByFilePath(s.mondel)
+	for _, f := range filepath {
+		if _, found := index[f]; found {
+			t.Errorf("Unexpected file %q found in the mondel file", f)
+		}
+	}
+}
+
+func (s *Sensor) AssertReportAndMondelFileListsMatch(t *testing.T) {
+	if s.creport == nil {
+		t.Fatal("No sensor report found")
+	}
+
+	if len(s.mondel) == 0 {
+		t.Fatal("No sensor mondel file found")
+	}
+
+	uniqMondelFiles := mondelEventByFilePath(s.mondel)
+	uniqCReportFiles := artifactsByFilePath(s.creport.Image.Files)
+
+	for f := range uniqMondelFiles {
+		if _, found := uniqCReportFiles[f]; !found {
+			t.Errorf("File %q found in mondel but not in container report", f)
+		}
+	}
+
+	for f := range uniqCReportFiles {
+		if _, found := uniqMondelFiles[f]; !found {
+			t.Errorf("File %q found in container report but not in mondel", f)
+		}
+	}
+}
+
+func (s *Sensor) AssertArtifactsArchiveContains(
+	t *testing.T,
+	ctx context.Context,
+	filename ...string,
+) {
+	archiveFilePath := filepath.Join(s.localArtifactsDirPath(), runArchiveName)
+	archiveFile, err := os.Open(archiveFilePath)
+	if err != nil {
+		t.Errorf("Cannot open report archive %q: %v", archiveFilePath, err)
+		return
+	}
+	defer archiveFile.Close()
+
+	found := map[string]bool{}
+	for _, f := range filename {
+		found[f] = false
+	}
+
+	reader := tar.NewReader(archiveFile)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Errorf("Failed reading tar archive header: %v", err)
+			continue
+		}
+
+		if _, expected := found[header.Name]; !expected {
+			continue
+		}
+
+		_, err = io.ReadAll(reader)
+		if err != nil {
+			t.Errorf("Failed reading expected tar archive entry %q: %v", header.Name, err)
+			continue
+		}
+
+		found[header.Name] = true
+	}
+
+	for name := range found {
+		if !found[name] {
+			t.Errorf("Artifacts archive doesn't contain entry %q", name)
+		}
+	}
+}
+
 func (s *Sensor) commonStartFlags() []string {
 	flags := []string{"-l", "debug", "-d"}
+	if len(s.artifactsDirPath) > 0 {
+		flags = append(flags, "-e", s.artifactsDirPath)
+	}
 	if s.useLogFile {
-		flags = append(flags, "-o", filepath.Join(artifactDirPath, sensorLogFileName))
+		flags = append(flags, "-o", filepath.Join(s.remoteArtifactsDirPath(), SensorLogFileName))
+	}
+	if s.enableMondel {
+		flags = append(flags, "-n")
 	}
 	if len(s.lifecycleHook) > 0 {
 		flags = append(flags, "-a", s.lifecycleHook)
 	}
 	return flags
+}
+
+func (s *Sensor) capabilities() (caps []string) {
+	for _, c := range s.capAdd {
+		caps = append(caps, "--cap-add="+c)
+	}
+	for _, c := range s.capDrop {
+		caps = append(caps, "--cap-drop="+c)
+	}
+	return caps
+}
+
+func (s *Sensor) localArtifactsDirPath() string {
+	return filepath.Join(s.contextDirPath, filepath.Base(s.remoteArtifactsDirPath()))
+}
+
+func (s *Sensor) remoteArtifactsDirPath() string {
+	if len(s.artifactsDirPath) > 0 {
+		return s.artifactsDirPath
+	}
+	return app.DefaultArtifactsDirPath
 }
 
 func startCommandControlled(
@@ -725,6 +1008,14 @@ func artifactsByFilePath(files []*report.ArtifactProps) map[string]*report.Artif
 		if props != nil {
 			dict[props.FilePath] = props
 		}
+	}
+	return dict
+}
+
+func mondelEventByFilePath(events []report.MonitorDataEvent) map[string]report.MonitorDataEvent {
+	dict := make(map[string]report.MonitorDataEvent)
+	for _, evt := range events {
+		dict[evt.Artifact] = evt
 	}
 	return dict
 }

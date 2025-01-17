@@ -11,21 +11,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker-slim/docker-slim/pkg/app"
-	"github.com/docker-slim/docker-slim/pkg/app/master/config"
-	"github.com/docker-slim/docker-slim/pkg/app/master/inspectors/image"
-	"github.com/docker-slim/docker-slim/pkg/app/master/inspectors/ipc"
-	"github.com/docker-slim/docker-slim/pkg/app/master/inspectors/sensor"
-	"github.com/docker-slim/docker-slim/pkg/app/master/kubernetes"
-	"github.com/docker-slim/docker-slim/pkg/app/master/security/apparmor"
-	"github.com/docker-slim/docker-slim/pkg/app/master/security/seccomp"
-	"github.com/docker-slim/docker-slim/pkg/ipc/channel"
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
-	"github.com/docker-slim/docker-slim/pkg/report"
-	"github.com/docker-slim/docker-slim/pkg/util/errutil"
-	"github.com/docker-slim/docker-slim/pkg/util/fsutil"
-	v "github.com/docker-slim/docker-slim/pkg/version"
+	"github.com/slimtoolkit/slim/pkg/app"
+	"github.com/slimtoolkit/slim/pkg/app/master/config"
+	"github.com/slimtoolkit/slim/pkg/app/master/inspectors/image"
+	"github.com/slimtoolkit/slim/pkg/app/master/inspectors/ipc"
+	"github.com/slimtoolkit/slim/pkg/app/master/inspectors/sensor"
+	"github.com/slimtoolkit/slim/pkg/app/master/kubernetes"
+	"github.com/slimtoolkit/slim/pkg/app/master/security/apparmor"
+	"github.com/slimtoolkit/slim/pkg/app/master/security/seccomp"
+	"github.com/slimtoolkit/slim/pkg/ipc/channel"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/report"
+	"github.com/slimtoolkit/slim/pkg/util/errutil"
+	"github.com/slimtoolkit/slim/pkg/util/fsutil"
+	v "github.com/slimtoolkit/slim/pkg/version"
 
 	dockerapi "github.com/fsouza/go-dockerclient"
 	log "github.com/sirupsen/logrus"
@@ -38,15 +38,15 @@ type ovars = app.OutVars
 
 // TODO: unify with similar constants in container_inspector.go
 const (
-	sensorVolumeName      = "dockerslim-sensor"
-	sensorVolumeMountPath = "/opt/dockerslim/bin"
+	sensorVolumeName      = "slim-sensor"
+	sensorVolumeMountPath = "/opt/_slim/bin"
 	sensorBinFileAbs      = sensorVolumeMountPath + "/" + sensor.LocalBinFile
-	sensorLoaderContainer = "dockerslim-sensor-loader"
+	sensorLoaderContainer = "slim-sensor-loader"
 
-	artifactsVolumeName = "dockerslim-artifacts"
+	artifactsVolumeName = "slim-artifacts"
 
 	targetPodLabelName = "dockersl.im/target-pod"
-	targetPodLabelPat  = "dockerslimk_%v_%v"
+	targetPodLabelPat  = "slimk_%v_%v"
 )
 
 type portInfo struct {
@@ -229,7 +229,7 @@ func (i *Inspector) FinishMonitoring() {
 		i.pod.Namespace,
 		i.pod.Name,
 		i.workload.TargetContainer().Name,
-		filepath.Join(app.DefaultArtifactDirPath, report.DefaultContainerReportFileName),
+		filepath.Join(app.DefaultArtifactsDirPath, report.DefaultContainerReportFileName),
 		filepath.Join(i.imageInspector.ArtifactLocation, report.DefaultContainerReportFileName),
 	)
 	if err != nil {
@@ -242,7 +242,7 @@ func (i *Inspector) FinishMonitoring() {
 		i.pod.Namespace,
 		i.pod.Name,
 		i.workload.TargetContainer().Name,
-		filepath.Join(app.DefaultArtifactDirPath, app.ArtifactFilesDirName),
+		filepath.Join(app.DefaultArtifactsDirPath, app.ArtifactFilesDirName),
 		filepath.Join(i.imageInspector.ArtifactLocation, app.ArtifactFilesDirName+"/"),
 	)
 	if err != nil {
@@ -253,9 +253,9 @@ func (i *Inspector) FinishMonitoring() {
 
 func (i *Inspector) ShowPodLogs() {
 	// TODO: Implement me!
-	fmt.Println("docker-slim: pod stdout:")
-	fmt.Println("docker-slim: pod stderr:")
-	fmt.Println("docker-slim: end of pod logs =============")
+	fmt.Println("slim: pod stdout:")
+	fmt.Println("slim: pod stderr:")
+	fmt.Println("slim: end of pod logs =============")
 }
 
 func (i *Inspector) ShutdownPod(resetChanges bool) {
@@ -344,7 +344,7 @@ func (i *Inspector) prepareWorkload() error {
 		},
 		corev1.VolumeMount{
 			Name:      artifactsVolumeName,
-			MountPath: app.DefaultArtifactDirPath,
+			MountPath: app.DefaultArtifactsDirPath,
 		},
 	)
 
@@ -632,7 +632,7 @@ func (i *Inspector) sensorCommandStart() error {
 						"status": "receive.timeout",
 					})
 
-				i.logger.Debug("timeout waiting for the docker-slim container to start...")
+				i.logger.Debug("timeout waiting for the slim container to start...")
 				continue
 			}
 
@@ -640,7 +640,7 @@ func (i *Inspector) sensorCommandStart() error {
 		}
 
 		if evt == nil || evt.Name == "" {
-			i.logger.Debug("empty event waiting for the docker-slim container to start (trying again)...")
+			i.logger.Debug("empty event waiting for the slim container to start (trying again)...")
 			continue
 		}
 
@@ -662,6 +662,8 @@ func (i *Inspector) sensorCommandStart() error {
 					"status": "received.unexpected",
 					"data":   fmt.Sprintf("%+v", evt),
 				})
+
+			//TODO: dump temp container logs
 			return event.ErrUnexpectedEvent
 		}
 	}

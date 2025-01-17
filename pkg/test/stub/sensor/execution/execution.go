@@ -3,9 +3,9 @@ package execution
 import (
 	log "github.com/sirupsen/logrus"
 
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/execution"
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/execution"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
 )
 
 type executionStub struct {
@@ -18,6 +18,10 @@ func NewExecution() *executionStub {
 	return &executionStub{
 		commands: make(chan command.Message),
 	}
+}
+
+func (e *executionStub) State() string {
+	return ""
 }
 
 func (e *executionStub) Commands() <-chan command.Message {
@@ -48,6 +52,10 @@ func (e *executionStub) HookSensorPreShutdown() {
 }
 
 func (e *executionStub) HookMonitorPreStart() {
+	// noop
+}
+
+func (e *executionStub) HookTargetAppRunning() {
 	// noop
 }
 

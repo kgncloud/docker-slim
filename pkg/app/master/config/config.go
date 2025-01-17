@@ -9,7 +9,7 @@ import (
 
 	docker "github.com/fsouza/go-dockerclient"
 
-	"github.com/docker-slim/docker-slim/pkg/util/fsutil"
+	"github.com/slimtoolkit/slim/pkg/util/fsutil"
 )
 
 // AppOptionsFilename is the default name for the app configs
@@ -27,12 +27,15 @@ type GlobalAppOptions struct {
 	NoColor      *bool   `json:"no_color,omitempty"`
 	Debug        *bool   `json:"debug,omitempty"`
 	Verbose      *bool   `json:"verbose,omitempty"`
+	Quiet        *bool   `json:"quiet,omitempty"`
+	OutputFormat *string `json:"output_format,omitempty"`
 	LogLevel     *string `json:"log_level,omitempty"`
 	Log          *string `json:"log,omitempty"`
 	LogFormat    *string `json:"log_format,omitempty"`
 	UseTLS       *bool   `json:"tls,omitempty"`
 	VerifyTLS    *bool   `json:"tls_verify,omitempty"`
 	TLSCertPath  *string `json:"tls_cert_path,omitempty"`
+	APIVersion   *string `json:"api_version,omitempty"`
 	Host         *string `json:"host,omitempty"`
 	ArchiveState *string `json:"archive_state,omitempty"`
 }
@@ -206,6 +209,7 @@ type DockerClient struct {
 	VerifyTLS   bool
 	TLSCertPath string
 	Host        string
+	APIVersion  string
 	Env         map[string]string
 }
 

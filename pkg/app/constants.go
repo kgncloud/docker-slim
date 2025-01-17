@@ -1,6 +1,6 @@
 package app
 
 const (
-	DefaultArtifactDirPath = "/opt/dockerslim/artifacts"
-	ArtifactFilesDirName   = "files"
+	DefaultArtifactsDirPath = "/opt/_slim/artifacts"
+	ArtifactFilesDirName    = "files"
 )

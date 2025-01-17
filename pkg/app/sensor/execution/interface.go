@@ -1,11 +1,12 @@
 package execution
 
 import (
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
 )
 
 type Interface interface {
+	State() string
 	Commands() <-chan command.Message
 	PubEvent(etype event.Type, data ...interface{})
 	Close()
@@ -14,6 +15,7 @@ type Interface interface {
 	HookSensorPostStart()
 	HookSensorPreShutdown()
 	HookMonitorPreStart()
+	HookTargetAppRunning()
 	HookMonitorPostShutdown()
 	HookMonitorFailed()
 }

@@ -9,37 +9,41 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/artifacts"
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/execution"
-	"github.com/docker-slim/docker-slim/pkg/app/sensor/monitors"
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
-)
-
-const (
-	signalBufSize = 10
+	"github.com/slimtoolkit/slim/pkg/app/sensor/artifact"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/execution"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/monitor"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/mondel"
+	"github.com/slimtoolkit/slim/pkg/util/errutil"
 )
 
 type Sensor struct {
 	ctx context.Context
 	exe execution.Interface
 
-	newMonitor monitors.NewCompositeMonitorFunc
-	artifactor artifacts.Artifactor
+	newMonitor monitor.NewCompositeMonitorFunc
+	del        mondel.Publisher
+	artifactor artifact.Processor
 
 	workDir    string
 	mountPoint string
 
-	stopSignal      os.Signal
-	stopGracePeriod time.Duration
+	signalCh chan os.Signal
+
+	stopSignal          os.Signal
+	stopGracePeriod     time.Duration
+	stopCommandReceived bool
 }
 
 func NewSensor(
 	ctx context.Context,
 	exe execution.Interface,
-	newMonitor monitors.NewCompositeMonitorFunc,
-	artifactor artifacts.Artifactor,
+	newMonitor monitor.NewCompositeMonitorFunc,
+	del mondel.Publisher,
+	artifactor artifact.Processor,
 	workDir string,
 	mountPoint string,
 	stopSignal os.Signal,
@@ -49,6 +53,7 @@ func NewSensor(
 		ctx:             ctx,
 		exe:             exe,
 		newMonitor:      newMonitor,
+		del:             del,
 		artifactor:      artifactor,
 		workDir:         workDir,
 		mountPoint:      mountPoint,
@@ -58,20 +63,70 @@ func NewSensor(
 }
 
 func (s *Sensor) Run() error {
-	cmd, ok := (<-s.exe.Commands()).(*command.StartMonitor)
+	s.exe.HookSensorPostStart()
+
+	err := s.run()
+	if err != nil {
+		s.exe.PubEvent(event.Error, err.Error())
+	}
+
+	// We have to dump the artifacts before invokin the pre-shutdown
+	// hook - it may want to upload the artifacts somewhere.
+	errutil.WarnOn(s.artifactor.Archive())
+
+	s.exe.HookSensorPreShutdown()
+	s.exe.PubEvent(event.ShutdownSensorDone)
+
+	// The target app can be done before the stop signal is received
+	// because of two reasons:
+	//
+	// - App terminated on its own (e.g., a typical CLI use case)
+	//
+	// - The "stop monitor" control command was received.
+	//
+	// In the latter case, sensor needs to wait for the stop signal
+	// before proceeding with the shutdown because otherwise the container
+	// runtime may restart the container which is not desirable.
+	if s.stopCommandReceived {
+		select {
+		case <-s.ctx.Done():
+		case <-s.signalCh:
+		}
+	}
+
+	return err
+}
+
+func (s *Sensor) run() error {
+	raw := <-s.exe.Commands()
+	cmd, ok := (raw).(*command.StartMonitor)
 	if !ok {
 		log.
 			WithField("cmd", fmt.Sprintf("%+v", cmd)).
 			Error("sensor: unexpected start monitor command")
 		s.exe.HookMonitorFailed()
-		s.exe.PubEvent(event.StartMonitorFailed)
+
+		s.exe.PubEvent(event.StartMonitorFailed,
+			&event.StartMonitorFailedData{
+				Component: event.ComSensorCmdServer,
+				State:     event.StateCmdStartMonCmdWaiting,
+				Context: map[string]string{
+					event.CtxCmdType: string(raw.GetName()),
+				},
+			})
+
 		return fmt.Errorf("unexpected start monitor command: %+v", cmd)
 	}
 
 	if err := s.artifactor.PrepareEnv(cmd); err != nil {
 		log.WithError(err).Error("sensor: artifactor.PrepareEnv() failed")
 		s.exe.HookMonitorFailed()
-		s.exe.PubEvent(event.StartMonitorFailed)
+		s.exe.PubEvent(event.StartMonitorFailed,
+			&event.StartMonitorFailedData{
+				Component: event.ComSensorCmdServer,
+				State:     event.StateEnvPreparing,
+				Errors:    []string{err.Error()},
+			})
 		return fmt.Errorf("failed to prepare artifacts env: %w", err)
 	}
 
@@ -87,21 +142,35 @@ func (s *Sensor) Run() error {
 		s.ctx,
 		cmd,
 		s.workDir,
+		s.del,
+		s.artifactor.ArtifactsDir(),
 		s.mountPoint,
 		origPaths,
-		initSignalForwardingChannel(s.ctx, s.stopSignal, s.stopGracePeriod),
 	)
 	if err != nil {
 		log.WithError(err).Error("sensor: failed to create composite monitor")
 		s.exe.HookMonitorFailed()
-		s.exe.PubEvent(event.StartMonitorFailed)
+		s.exe.PubEvent(event.StartMonitorFailed,
+			&event.StartMonitorFailedData{
+				Component: event.ComSensorCmdServer,
+				State:     event.StateMonCreating,
+				Errors:    []string{err.Error()},
+			})
 		return err
 	}
+
+	s.signalCh = make(chan os.Signal, 1024)
+	go s.runSignalForwarder(mon)
 
 	if err := mon.Start(); err != nil {
 		log.WithError(err).Error("sensor: failed to start composite monitor")
 		s.exe.HookMonitorFailed()
-		s.exe.PubEvent(event.StartMonitorFailed)
+		s.exe.PubEvent(event.StartMonitorFailed,
+			&event.StartMonitorFailedData{
+				Component: event.ComSensorCmdServer,
+				State:     event.StateMonStarting,
+				Errors:    []string{err.Error()},
+			})
 		return err
 	}
 	s.exe.PubEvent(event.StartMonitorDone)
@@ -117,33 +186,45 @@ func (s *Sensor) Run() error {
 	s.exe.HookMonitorPostShutdown()
 	s.exe.PubEvent(event.StopMonitorDone)
 
-	if err := s.artifactor.ProcessReports(
+	if err := s.artifactor.Process(
 		cmd,
 		s.mountPoint,
 		report.PeReport,
 		report.FanReport,
 		report.PtReport,
 	); err != nil {
-		log.WithError(err).Error("sensor: artifacts.ProcessReports() failed")
+		log.WithError(err).Error("sensor: artifact.Process() failed")
 		return fmt.Errorf("saving reports failed: %w", err)
 	}
 
-	s.exe.PubEvent(event.ShutdownSensorDone)
 	return nil
 }
 
-func (s *Sensor) runMonitor(mon monitors.CompositeMonitor) {
+func (s *Sensor) runMonitor(mon monitor.CompositeMonitor) {
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+
 loop:
 	for {
 		select {
 		case <-mon.Done():
 			break loop
 
+		case cmd := <-s.exe.Commands():
+			log.Infof("sensor: recieved control command => %s", cmd.GetName())
+			if cmd.GetName() == command.StopMonitorName {
+				s.stopCommandReceived = true
+				s.signalTargetApp(mon, s.stopSignal)
+			} else {
+				log.Warnf("sensor: unsupported control command => %s", cmd.GetName())
+			}
+
 		case err := <-mon.Errors():
 			log.WithError(err).Warn("sensor: non-critical monitor error condition")
-			s.exe.PubEvent(event.Error, monitors.NonCriticalError(err).Error())
+			s.exe.PubEvent(event.Error, monitor.NonCriticalError(err).Error())
 
-		case <-time.After(time.Second * 5):
+		case <-ticker.C:
+			s.exe.HookTargetAppRunning()
 			log.Debug(".")
 		}
 
@@ -157,52 +238,71 @@ loop:
 	// "single-threaded" keeps reasoning about the logic.
 	for _, err := range mon.DrainErrors() {
 		log.WithError(err).Warn("sensor: non-critical monitor error condition (drained)")
-		s.exe.PubEvent(event.Error, monitors.NonCriticalError(err).Error())
+		s.exe.PubEvent(event.Error, monitor.NonCriticalError(err).Error())
 	}
 }
 
-func initSignalForwardingChannel(
-	ctx context.Context,
-	stopSignal os.Signal,
-	stopGracePeriod time.Duration,
-) <-chan os.Signal {
-	signalCh := make(chan os.Signal, signalBufSize)
+// TODO: Combine the signal forwarder loop with the run monitor loop
+//
+//	to avoid competting event loops - this will simplify the code
+//	and let us avoid subtle race conditions when the stop signal
+//	arrives while the app is being stoped due to the stop control command.
+func (s *Sensor) runSignalForwarder(mon monitor.CompositeMonitor) {
+	log.Debug("sensor: starting forwarding signals to target app...")
 
-	go func() {
-		log.Debug("sensor: starting forwarding signals to target app...")
+	signal.Notify(s.signalCh)
 
-		ch := make(chan os.Signal)
-		signal.Notify(ch)
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Debug("sensor: forwarding signal to target app no more - sensor is done")
+			return
 
-		for {
+		case sig := <-s.signalCh:
+			if s.stopCommandReceived && sig == s.stopSignal {
+				signal.Stop(s.signalCh)
+				close(s.signalCh)
+			}
+
 			select {
-			case <-ctx.Done():
-				log.Debug("sensor: forwarding signal to target app no more - sensor is done")
-				return
-			case s := <-ch:
-				if s != syscall.SIGCHLD {
+			case <-mon.Done():
+				log.Debug("sensor: skipping signal forwarding - target app is done")
+
+			default:
+				if sig != syscall.SIGCHLD {
 					// Due to ptrace, SIGCHLDs flood the output.
 					// TODO: Log SIGCHLD if ptrace-ing is off.
-					log.WithField("signal", s).Debug("sensor: forwarding signal to target app")
+					log.Debugf("sensor: forwarding signal %s to target app", unix.SignalName(sig.(syscall.Signal)))
 				}
-				signalCh <- s
-
-				if s == stopSignal {
-					log.Debug("sensor: recieved stop signal - starting grace period")
-
-					// Starting the grace period
-					select {
-					case <-ctx.Done():
-						log.Debug("sensor: finished before grace timeout - dismantling SIGKILL")
-					case <-time.After(stopGracePeriod):
-						log.Debug("sensor: grace timeout expired - SIGKILL goes to target app")
-						signalCh <- syscall.SIGKILL
-					}
-					return
-				}
+				s.signalTargetApp(mon, sig)
 			}
 		}
-	}()
+	}
+}
 
-	return signalCh
+func (s *Sensor) signalTargetApp(mon monitor.CompositeMonitor, sig os.Signal) {
+	mon.SignalTargetApp(sig)
+
+	if sig == s.stopSignal {
+		log.Debug("sensor: stop signal was sent to target app - starting grace period")
+
+		go func() {
+			// Starting the grace period.
+			timer := time.NewTimer(s.stopGracePeriod)
+			defer func() {
+				if !timer.Stop() {
+					<-timer.C
+				}
+			}()
+
+			select {
+			case <-mon.Done():
+				log.Debug("sensor: target app finished before grace timeout - dismantling SIGKILL")
+
+			case <-timer.C:
+				log.Debug("sensor: grace timeout expired - SIGKILL goes to target app")
+				mon.SignalTargetApp(syscall.SIGKILL)
+			}
+		}()
+	}
 }

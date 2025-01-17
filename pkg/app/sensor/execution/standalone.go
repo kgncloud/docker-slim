@@ -12,9 +12,10 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/docker-slim/docker-slim/pkg/ipc/command"
-	"github.com/docker-slim/docker-slim/pkg/ipc/event"
-	"github.com/docker-slim/docker-slim/pkg/util/fsutil"
+	"github.com/slimtoolkit/slim/pkg/app/sensor/standalone/control"
+	"github.com/slimtoolkit/slim/pkg/ipc/command"
+	"github.com/slimtoolkit/slim/pkg/ipc/event"
+	"github.com/slimtoolkit/slim/pkg/util/fsutil"
 )
 
 type standaloneExe struct {
@@ -38,7 +39,7 @@ func NewStandalone(
 		)
 	}
 
-	eventFile, err := os.OpenFile(eventFileName, os.O_APPEND|os.O_WRONLY, 0644)
+	eventFile, err := os.OpenFile(eventFileName, os.O_APPEND|os.O_WRONLY|os.O_SYNC, 0644)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"cannot create execution - open event file %q failed: %w",
@@ -54,8 +55,10 @@ func NewStandalone(
 		)
 	}
 
-	commandCh := make(chan command.Message, 1)
+	commandCh := make(chan command.Message, 10)
 	commandCh <- &cmd
+
+	go control.HandleControlCommandQueue(ctx, commandFileName, commandCh)
 
 	return &standaloneExe{
 		hookExecutor: hookExecutor{
@@ -79,8 +82,12 @@ func (e *standaloneExe) Commands() <-chan command.Message {
 func (e *standaloneExe) PubEvent(name event.Type, data ...interface{}) {
 	encoder := json.NewEncoder(e.eventFile)
 	encoder.SetEscapeHTML(false)
+	evt := event.Message{Name: name}
+	if len(data) > 0 {
+		evt.Data = data[0]
+	}
 
-	if err := encoder.Encode(event.Message{Name: name, Data: data}); err != nil {
+	if err := encoder.Encode(evt); err != nil {
 		log.WithError(err).Warn("sensor: failed dumping event")
 	}
 }

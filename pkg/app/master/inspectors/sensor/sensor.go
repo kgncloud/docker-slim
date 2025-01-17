@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/docker-slim/docker-slim/pkg/app"
-	"github.com/docker-slim/docker-slim/pkg/util/fsutil"
-	v "github.com/docker-slim/docker-slim/pkg/version"
+	"github.com/slimtoolkit/slim/pkg/app"
+	"github.com/slimtoolkit/slim/pkg/util/fsutil"
+	v "github.com/slimtoolkit/slim/pkg/version"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -15,7 +15,7 @@ import (
 type ovars = app.OutVars
 
 const (
-	LocalBinFile       = "docker-slim-sensor"
+	LocalBinFile       = "slim-sensor"
 	DefaultConnectWait = 60
 )
 
@@ -39,27 +39,38 @@ func EnsureLocalBinary(xc *app.ExecutionContext, logger *log.Entry, statePath st
 
 			xc.Out.State("exited",
 				ovars{
-					"exit.code": -125,
-					"component": "container.inspector",
-					"version":   v.Current(),
+					"exit.code":    -999,
+					"component":    "container.inspector",
+					"version":      v.Current(),
+					"location.exe": fsutil.ExeDir(),
 				})
 		}
 
-		xc.Exit(-125)
+		xc.Exit(-999)
 	}
 
 	if finfo, err := os.Lstat(sensorPath); err == nil {
-		logger.Debugf("RunContainer: sensor (%s) perms => %#o", sensorPath, finfo.Mode().Perm())
+		logger.Debugf("sensor.EnsureLocalBinary: sensor (%s) perms => %#o", sensorPath, finfo.Mode().Perm())
 		if finfo.Mode().Perm()&fsutil.FilePermUserExe == 0 {
-			logger.Debugf("RunContainer: sensor (%s) missing execute permission", sensorPath)
+			if printState {
+				xc.Out.Info("sensor.perms",
+					ovars{
+						"message":  "sensor missing execute permission",
+						"location": sensorPath,
+						"mode":     finfo.Mode().String(),
+						"perm":     finfo.Mode().Perm().String(),
+					})
+			}
+
+			logger.Debugf("sensor.EnsureLocalBinary: sensor (%s) missing execute permission", sensorPath)
 			updatedMode := finfo.Mode() | fsutil.FilePermUserExe | fsutil.FilePermGroupExe | fsutil.FilePermOtherExe
 			if err = os.Chmod(sensorPath, updatedMode); err != nil {
-				logger.Errorf("RunContainer: error updating sensor (%s) perms (%#o -> %#o) => %v",
+				logger.Errorf("sensor.EnsureLocalBinary: error updating sensor (%s) perms (%#o -> %#o) => %v",
 					sensorPath, finfo.Mode().Perm(), updatedMode.Perm(), err)
 			}
 		}
 	} else {
-		logger.Errorf("RunContainer: error getting sensor (%s) info => %#v", sensorPath, err)
+		logger.Errorf("sensor.EnsureLocalBinary: error getting sensor (%s) info => %#v", sensorPath, err)
 	}
 
 	return sensorPath
